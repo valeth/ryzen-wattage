@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom},
     path::PathBuf,
@@ -13,8 +13,9 @@ type MsrMap = BTreeMap<u32, Msr>;
 
 #[derive(Debug)]
 struct Cpu {
-    smt_enabled: bool,
-    core_count: u32,
+    pub smt_enabled: bool,
+    pub core_count: u32,
+    pub physical_core_count: u32,
     core_msr: MsrMap,
 }
 
@@ -23,27 +24,55 @@ impl Cpu {
         let smt_status = fs::read_to_string("/sys/devices/system/cpu/smt/control")?;
         let smt_enabled = smt_status.trim_end() == "on";
 
-        let cores_online = fs::read_to_string("/sys/devices/system/cpu/online")?;
-        let (_, max) = cores_online.trim_end().split_once("-").unwrap();
-        let core_count = max.parse::<u32>().unwrap() + 1;
-
-        let core_msr = Self::get_msr_info(smt_enabled, core_count);
+        let core_count = Self::get_cores()?;
+        let physical_core_count = Self::get_physical_cores(smt_enabled, core_count)?;
+        let core_msr = Self::get_msr_info(physical_core_count);
 
         Ok(Self {
             smt_enabled,
             core_count,
+            physical_core_count,
             core_msr,
         })
     }
 
-    fn get_msr_info(smt_enabled: bool, core_count: u32) -> MsrMap {
+    fn get_cores() -> io::Result<u32> {
+        let cores_online = fs::read_to_string("/sys/devices/system/cpu/online")?;
+        let (_, max) = cores_online.trim_end().split_once("-").unwrap();
+        let cores_online_max = max.parse::<u32>().unwrap() + 1;
+        Ok(cores_online_max)
+    }
+
+    fn get_physical_cores(smt_enabled: bool, core_count: u32) -> io::Result<u32> {
+        let core_count = if smt_enabled {
+            let mut cores = BTreeSet::new();
+            for core_id in 0..core_count {
+                let cpus_list = fs::read_to_string(format!(
+                    "/sys/devices/system/cpu/cpu{}/topology/core_cpus_list",
+                    core_id
+                ))?;
+                let min_cpu_id = cpus_list
+                    .trim_end()
+                    .split(",")
+                    .map(|val| val.parse::<u32>().unwrap())
+                    .min()
+                    .unwrap();
+                cores.insert(min_cpu_id);
+            }
+            cores.len() as u32
+        } else {
+            core_count
+        };
+
+        Ok(core_count)
+    }
+
+    fn get_msr_info(physical_core_count: u32) -> MsrMap {
         let mut map = MsrMap::new();
 
-        for core in 0..core_count {
-            if smt_enabled && core % 2 == 0 {
-                let msr = Msr::new(core);
-                map.insert(core, msr);
-            }
+        for core in 0..physical_core_count {
+            let msr = Msr::new(core);
+            map.insert(core, msr);
         }
 
         map
@@ -150,5 +179,8 @@ fn main() {
         println!("Core {}: {:.2}W", core, core_power);
     }
 
-    println!("Cores Total: {:.2}W", core_sum);
+    println!(
+        "Cores Total: {:.2}W",
+        core_sum * ((cpu.core_count / cpu.physical_core_count) as f64)
+    );
 }
